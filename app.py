@@ -1,290 +1,315 @@
+"""Streamlit dashboard for interactive market basket analysis."""
+
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
+import plotly.express as px
 import streamlit as st
-from matplotlib.ticker import FuncFormatter
 
-from sales_analysis import clean_sales_data, load_sales_data
+from market_basket.analysis import (
+    mine_association_rules,
+    prepare_transactions,
+    read_csv_dataset,
+)
 
 
 APP_DIR = Path(__file__).parent
-DATASET_PATH = APP_DIR / "sales_data.csv"
-CURRENCY_FORMATTER = FuncFormatter(lambda value, _: f"${value:,.0f}")
-CHART_COLOR = "#2673b8"
+DEFAULT_DATASET = APP_DIR / "data" / "sample_transactions.csv"
 
 st.set_page_config(
-    page_title="Sales Analysis Dashboard",
-    page_icon="📊",
+    page_title="Market Basket Analysis",
+    page_icon="🛒",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 st.markdown(
     """
     <style>
-    .stApp {background-color: #f5f7fb;}
+    .stApp { background: #f5f7fb; }
     [data-testid="stMetric"] {
         background: #ffffff; border: 1px solid #e3e8f0;
         padding: 16px 18px; border-radius: 12px;
+    }
+    .project-footer {
+        border-top: 1px solid #dfe5ee; color: #64748b;
+        margin-top: 3rem; padding: 1rem 0; text-align: center;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("Sales Analysis Dashboard")
-st.markdown(
-    "Explore revenue, order volume, customer segments, and product performance. "
-    "Use the filters to compare the parts of the business that matter to you."
-)
 
-try:
-    default_data = load_sales_data(DATASET_PATH)
-except (OSError, ValueError, pd.errors.ParserError) as error:
-    st.error(f"Could not load the sales dataset: {error}")
-    st.stop()
+def _format_items(value: object) -> str:
+    return ", ".join(sorted(str(item) for item in value))
+
+
+st.title("Market Basket Analysis")
+st.markdown(
+    "Discover products that frequently occur together and translate association "
+    "rules into practical merchandising decisions."
+)
+st.caption(
+    "An Apriori-based analysis of transaction-level data for the Chandigarh "
+    "University project portfolio."
+)
 
 with st.sidebar:
     st.header("Dataset")
     uploaded_file = st.file_uploader(
-        "Upload a sales CSV (optional)",
+        "Upload a transaction CSV",
         type=["csv"],
-        help="Required columns: Order ID, Order Date, Product Name, Category, "
-        "Region, Customer Segment, Quantity, and Unit Price.",
+        help="The file must contain one transaction ID column and one product/item column.",
     )
     st.download_button(
-        "Download sales dataset",
-        data=default_data.dataframe.to_csv(index=False).encode("utf-8"),
-        file_name="sales_data.csv",
+        "Download sample dataset",
+        data=DEFAULT_DATASET.read_bytes(),
+        file_name=DEFAULT_DATASET.name,
         mime="text/csv",
         use_container_width=True,
     )
-    st.divider()
-    st.header("Filters")
 
 try:
     if uploaded_file is None:
-        sales_data = default_data
-        source_label = DATASET_PATH.name
+        with DEFAULT_DATASET.open("rb") as dataset_file:
+            raw_data = read_csv_dataset(dataset_file)
+        source_label = DEFAULT_DATASET.relative_to(APP_DIR).as_posix()
     else:
-        uploaded_data = pd.read_csv(uploaded_file)
-        sales_data = clean_sales_data(uploaded_data)
+        raw_data = read_csv_dataset(uploaded_file)
         source_label = uploaded_file.name
-except (OSError, ValueError, pd.errors.ParserError, UnicodeDecodeError) as error:
-    st.error(f"Could not read the uploaded sales dataset: {error}")
+except (OSError, ValueError) as error:
+    st.error(f"Could not load the transaction dataset: {error}")
     st.stop()
 
-sales = sales_data.dataframe
-date_min = sales["Order Date"].min().date()
-date_max = sales["Order Date"].max().date()
+if len(raw_data.columns) < 2:
+    st.error("The dataset must contain at least two columns.")
+    st.stop()
 
 with st.sidebar:
-    selected_categories = st.multiselect(
-        "Product category",
-        options=sorted(sales["Category"].unique()),
-        default=sorted(sales["Category"].unique()),
+    st.header("Columns")
+    transaction_column = st.selectbox(
+        "Transaction ID column",
+        options=list(raw_data.columns),
+        index=0,
+        help="Identifies the basket or order containing the item.",
     )
-    selected_regions = st.multiselect(
-        "Region",
-        options=sorted(sales["Region"].unique()),
-        default=sorted(sales["Region"].unique()),
+    item_options = [column for column in raw_data.columns if column != transaction_column]
+    item_column = st.selectbox(
+        "Product/item column",
+        options=item_options,
+        index=0,
+        help="Contains the product or item name.",
     )
-    selected_segments = st.multiselect(
-        "Customer segment",
-        options=sorted(sales["Customer Segment"].unique()),
-        default=sorted(sales["Customer Segment"].unique()),
+    st.divider()
+    st.header("Apriori filters")
+    min_support = st.slider(
+        "Minimum support",
+        min_value=0.01,
+        max_value=1.0,
+        value=0.20,
+        step=0.01,
+        help="Share of transactions containing an itemset.",
     )
-    selected_dates = st.date_input(
-        "Order date range",
-        value=(date_min, date_max),
-        min_value=date_min,
-        max_value=date_max,
+    min_confidence = st.slider(
+        "Minimum confidence",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.50,
+        step=0.05,
+        help="Likelihood of the consequent when the antecedent occurs.",
     )
+    min_lift = st.number_input(
+        "Minimum lift",
+        min_value=0.0,
+        value=1.0,
+        step=0.1,
+        help="Values above 1 indicate a positive association.",
+    )
+    max_rules = st.slider("Rules to display", 5, 100, 25, 5)
 
-if isinstance(selected_dates, (tuple, list)):
-    start_date = selected_dates[0]
-    end_date = selected_dates[-1] if len(selected_dates) > 1 else selected_dates[0]
-else:
-    start_date = end_date = selected_dates
-
-filtered = sales.loc[
-    sales["Category"].isin(selected_categories)
-    & sales["Region"].isin(selected_regions)
-    & sales["Customer Segment"].isin(selected_segments)
-    & sales["Order Date"].dt.date.between(start_date, end_date)
-].copy()
-
-st.caption(
-    f"Source: {source_label} · {len(sales):,} cleaned rows · "
-    f"{sales_data.duplicate_rows:,} duplicate rows removed · "
-    f"{sales_data.dropped_rows:,} incomplete or invalid rows removed"
-)
-
-if filtered.empty:
-    st.warning("No sales match the selected filters. Adjust the sidebar filters.")
+try:
+    transactions = prepare_transactions(raw_data, transaction_column, item_column)
+    analysis = mine_association_rules(
+        transactions,
+        min_support=min_support,
+        min_confidence=min_confidence,
+        min_lift=min_lift,
+        max_rules=max_rules,
+    )
+except ValueError as error:
+    st.error(f"Unable to analyze this dataset: {error}")
+    st.info("Upload long-format data with one row per item in a transaction.")
     st.stop()
 
-total_revenue = float(filtered["Sales Revenue"].sum())
-total_orders = int(filtered["Order ID"].nunique())
-total_quantity = int(filtered["Quantity"].sum())
-average_order_value = total_revenue / total_orders if total_orders else 0.0
+st.caption(
+    f"Source: {source_label} · {transactions.dropped_missing_rows:,} invalid rows "
+    f"removed · {transactions.duplicate_rows:,} duplicate item entries removed"
+)
 
 kpi_columns = st.columns(4)
-kpi_columns[0].metric("Total Revenue", f"${total_revenue:,.2f}")
-kpi_columns[1].metric("Total Orders", f"{total_orders:,}")
-kpi_columns[2].metric("Total Quantity Sold", f"{total_quantity:,}")
-kpi_columns[3].metric("Average Order Value", f"${average_order_value:,.2f}")
-
-monthly_revenue = (
-    filtered.assign(Month=filtered["Order Date"].dt.to_period("M").dt.to_timestamp())
-    .groupby("Month", as_index=False)["Sales Revenue"]
-    .sum()
+kpi_columns[0].metric("Transactions analyzed", f"{transactions.transaction_count:,}")
+kpi_columns[1].metric("Unique products", f"{transactions.unique_product_count:,}")
+kpi_columns[2].metric(
+    "Frequent itemsets",
+    f"{len(analysis.frequent_itemsets):,}",
+    help="Item combinations meeting the selected minimum support.",
 )
-category_revenue = (
-    filtered.groupby("Category", as_index=False)["Sales Revenue"]
-    .sum()
-    .sort_values("Sales Revenue", ascending=False)
-)
-region_revenue = (
-    filtered.groupby("Region", as_index=False)["Sales Revenue"]
-    .sum()
-    .sort_values("Sales Revenue", ascending=False)
-)
-segment_revenue = filtered.groupby("Customer Segment")["Sales Revenue"].sum()
-product_revenue = (
-    filtered.groupby("Product Name")["Sales Revenue"]
-    .sum()
-    .nlargest(10)
-    .sort_values()
+kpi_columns[3].metric(
+    "Association rules",
+    f"{analysis.rules_found:,}",
+    help="Rules meeting the selected confidence and lift thresholds.",
 )
 
-plt.rcParams.update(
-    {
-        "axes.spines.top": False,
-        "axes.spines.right": False,
-        "axes.titleweight": "bold",
-        "figure.facecolor": "white",
-        "axes.facecolor": "white",
-    }
-)
-
-st.subheader("Monthly Revenue Trend")
-figure, axis = plt.subplots(figsize=(12, 4))
-axis.plot(
-    monthly_revenue["Month"],
-    monthly_revenue["Sales Revenue"],
-    color=CHART_COLOR,
-    marker="o",
-    linewidth=2.5,
-)
-axis.set_title("Revenue by Month")
-axis.set_xlabel("Month")
-axis.set_ylabel("Sales revenue (USD)")
-axis.yaxis.set_major_formatter(CURRENCY_FORMATTER)
-axis.grid(axis="y", alpha=0.25)
-figure.autofmt_xdate()
-figure.tight_layout()
-st.pyplot(figure, use_container_width=True)
-plt.close(figure)
-
-left_chart, right_chart = st.columns(2)
-with left_chart:
-    figure, axis = plt.subplots(figsize=(7, 4))
-    axis.bar(category_revenue["Category"], category_revenue["Sales Revenue"], color=CHART_COLOR)
-    axis.set_title("Category-wise Revenue")
-    axis.set_xlabel("Category")
-    axis.set_ylabel("Sales revenue (USD)")
-    axis.yaxis.set_major_formatter(CURRENCY_FORMATTER)
-    axis.tick_params(axis="x", rotation=25)
-    axis.grid(axis="y", alpha=0.2)
-    figure.tight_layout()
-    st.pyplot(figure, use_container_width=True)
-    plt.close(figure)
-
-with right_chart:
-    figure, axis = plt.subplots(figsize=(7, 4))
-    axis.bar(region_revenue["Region"], region_revenue["Sales Revenue"], color="#42a58a")
-    axis.set_title("Region-wise Sales")
-    axis.set_xlabel("Region")
-    axis.set_ylabel("Sales revenue (USD)")
-    axis.yaxis.set_major_formatter(CURRENCY_FORMATTER)
-    axis.grid(axis="y", alpha=0.2)
-    figure.tight_layout()
-    st.pyplot(figure, use_container_width=True)
-    plt.close(figure)
-
-left_chart, right_chart = st.columns(2)
-with left_chart:
-    figure, axis = plt.subplots(figsize=(7, 4))
-    axis.pie(
-        segment_revenue,
-        labels=segment_revenue.index,
-        autopct="%1.1f%%",
-        startangle=90,
-        colors=plt.get_cmap("Set2").colors[: len(segment_revenue)],
-        wedgeprops={"linewidth": 1, "edgecolor": "white"},
+if analysis.frequent_itemsets.empty:
+    st.warning(
+        "No frequent itemsets meet the selected support threshold. "
+        "Lower minimum support to explore more combinations."
     )
-    axis.set_title("Customer Segment Distribution (Revenue)")
-    axis.axis("equal")
-    figure.tight_layout()
-    st.pyplot(figure, use_container_width=True)
-    plt.close(figure)
 
-with right_chart:
-    figure, axis = plt.subplots(figsize=(7, 4))
-    axis.barh(product_revenue.index, product_revenue.values, color="#e59345")
-    axis.set_title("Top 10 Products by Revenue")
-    axis.set_xlabel("Sales revenue (USD)")
-    axis.set_ylabel("Product")
-    axis.xaxis.set_major_formatter(CURRENCY_FORMATTER)
-    axis.grid(axis="x", alpha=0.2)
-    figure.tight_layout()
-    st.pyplot(figure, use_container_width=True)
-    plt.close(figure)
+frequency = (
+    transactions.basket_matrix.sum()
+    .sort_values(ascending=False)
+    .rename("Transactions")
+    .reset_index()
+    .rename(columns={"col_0": "Product", "index": "Product"})
+)
+if "Product" not in frequency:
+    frequency = frequency.rename(columns={frequency.columns[0]: "Product"})
+frequency["Share"] = frequency["Transactions"] / transactions.transaction_count
 
-best_product = filtered.groupby("Product Name")["Sales Revenue"].sum().idxmax()
-best_category = category_revenue.iloc[0]["Category"]
-best_region = region_revenue.iloc[0]["Region"]
-best_month = monthly_revenue.loc[
-    monthly_revenue["Sales Revenue"].idxmax(), "Month"
-].strftime("%B %Y")
-
-st.subheader("Performance Highlights")
-insight_columns = st.columns(4)
-insight_columns[0].info(f"**Top product:** {best_product}")
-insight_columns[1].info(f"**Top category:** {best_category}")
-insight_columns[2].info(f"**Top region:** {best_region}")
-insight_columns[3].info(f"**Highest-revenue month:** {best_month}")
-
-with st.expander("Summary statistics"):
-    statistics = filtered[["Quantity", "Unit Price", "Sales Revenue"]].describe().T
-    statistics["mean"] = np.mean(filtered[statistics.index], axis=0)
+left, right = st.columns((1.1, 1))
+with left:
+    st.subheader("Most frequently purchased products")
+    frequency_chart = px.bar(
+        frequency.head(15).sort_values("Transactions"),
+        x="Transactions",
+        y="Product",
+        orientation="h",
+        text="Transactions",
+        color="Transactions",
+        color_continuous_scale=["#b7d7f0", "#1769aa"],
+    )
+    frequency_chart.update_layout(
+        height=470,
+        coloraxis_showscale=False,
+        xaxis_title="Transactions containing product",
+        yaxis_title=None,
+        margin=dict(l=10, r=10, t=20, b=20),
+    )
+    st.plotly_chart(frequency_chart, use_container_width=True)
+with right:
+    st.subheader("What the metrics mean")
+    st.info(
+        "**Support** measures how often an itemset appears in all baskets. "
+        "**Confidence** measures how often the consequent appears when the "
+        "antecedent is present. **Lift** compares that result with random "
+        "co-occurrence: lift above 1 indicates a positive association."
+    )
     st.dataframe(
-        statistics,
+        frequency.assign(
+            Share=frequency["Share"].map(lambda value: f"{value:.1%}")
+        )[["Product", "Transactions", "Share"]],
         use_container_width=True,
-        column_config={
-            "mean": st.column_config.NumberColumn("mean", format="%.2f"),
-            "std": st.column_config.NumberColumn("std", format="%.2f"),
-            "min": st.column_config.NumberColumn("min", format="%.2f"),
-            "max": st.column_config.NumberColumn("max", format="%.2f"),
-        },
+        hide_index=True,
     )
 
-st.subheader("Sales Dataset")
-st.dataframe(
-    filtered.sort_values("Order Date", ascending=False),
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "Order Date": st.column_config.DateColumn("Order Date", format="YYYY-MM-DD"),
-        "Unit Price": st.column_config.NumberColumn("Unit Price", format="$%.2f"),
-        "Sales Revenue": st.column_config.NumberColumn("Sales Revenue", format="$%.2f"),
-    },
-)
+st.subheader("Strongest association rules")
+if analysis.rules.empty:
+    st.warning(
+        "No association rules meet all selected thresholds. "
+        "Try lowering confidence or lift."
+    )
+else:
+    rules_display = analysis.rules.copy()
+    rules_display["Rule"] = (
+        rules_display["antecedents"] + " → " + rules_display["consequents"]
+    )
+    rules_display["Support"] = rules_display["support"].map(lambda value: f"{value:.1%}")
+    rules_display["Confidence"] = rules_display["confidence"].map(
+        lambda value: f"{value:.1%}"
+    )
+    rules_display["Lift"] = rules_display["lift"].map(lambda value: f"{value:.2f}")
+    st.dataframe(
+        rules_display[["Rule", "Support", "Confidence", "Lift"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.download_button(
+        "Download association rules",
+        data=analysis.rules.to_csv(index=False).encode("utf-8"),
+        file_name="association_rules.csv",
+        mime="text/csv",
+    )
+
+    rule_chart_data = analysis.rules.head(15).copy()
+    rule_chart_data["Rule"] = (
+        rule_chart_data["antecedents"] + " → " + rule_chart_data["consequents"]
+    )
+    rule_chart = px.scatter(
+        rule_chart_data,
+        x="support",
+        y="confidence",
+        size="lift",
+        color="lift",
+        hover_name="Rule",
+        color_continuous_scale="Teal",
+        labels={"support": "Support", "confidence": "Confidence", "lift": "Lift"},
+    )
+    rule_chart.update_layout(
+        height=430,
+        xaxis_tickformat=".0%",
+        yaxis_tickformat=".0%",
+        margin=dict(l=10, r=10, t=20, b=20),
+    )
+    st.plotly_chart(rule_chart, use_container_width=True)
+
+with st.expander("Frequent itemsets"):
+    if analysis.frequent_itemsets.empty:
+        st.info("No frequent itemsets to display.")
+    else:
+        itemsets_display = analysis.frequent_itemsets.copy()
+        itemsets_display["Items"] = itemsets_display["itemsets"].map(_format_items)
+        itemsets_display["Support"] = itemsets_display["support"].map(
+            lambda value: f"{value:.1%}"
+        )
+        st.dataframe(
+            itemsets_display[["Items", "Support"]].sort_values(
+                "Support", ascending=False
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+with st.expander("Business interpretation"):
+    if analysis.rules.empty:
+        st.write(
+            "There are no qualifying rules at the current thresholds. This is a "
+            "valid analytical result: increase the amount of transaction history "
+            "or relax the thresholds before making merchandising decisions."
+        )
+    else:
+        strongest = analysis.rules.iloc[0]
+        st.write(
+            f"The strongest displayed rule is **{strongest['antecedents']} → "
+            f"{strongest['consequents']}** with {strongest['confidence']:.1%} "
+            f"confidence and {strongest['lift']:.2f} lift. Possible applications "
+            "include bundle offers, shelf placement, cross-selling prompts, and "
+            "recommendation-system features. These associations indicate "
+            "co-occurrence, not causation, and should be validated with business "
+            "experiments."
+        )
+
 st.download_button(
-    "Download filtered sales as CSV",
-    data=filtered.to_csv(index=False).encode("utf-8"),
-    file_name="filtered_sales_data.csv",
+    "Download cleaned transaction records",
+    data=transactions.records.to_csv(index=False).encode("utf-8"),
+    file_name="cleaned_transactions.csv",
     mime="text/csv",
+)
+
+st.markdown(
+    '<div class="project-footer">Built by Gungun Gupta · '
+    '<a href="https://github.com/gungun1708/Market-Basket-Analysis" '
+    'target="_blank">GitHub repository</a></div>',
+    unsafe_allow_html=True,
 )
